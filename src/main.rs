@@ -586,6 +586,7 @@ impl State {
 
         // Finalize the command buffer and submit it to the GPU's command queue.
         self.queue.submit(std::iter::once(encoder.finish()));
+
         // Present the rendered texture to the screen.
         output.present();
 
@@ -769,8 +770,7 @@ pub fn run() -> anyhow::Result<()> {
     // Create the winit event loop.
     let event_loop = EventLoop::new()?;
 
-    // Set control flow to poll for smooth interaction.
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     // Create our main application struct.
     let mut app = App::new();
