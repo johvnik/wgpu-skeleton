@@ -2,7 +2,7 @@
 
 use crate::ecs::{Component, EntityId, World};
 use crate::math::{Matrix4, Point3, Transform, Vector3};
-use cgmath::{perspective, Deg, EuclideanSpace, InnerSpace as _};
+use cgmath::{perspective, Deg, EuclideanSpace};
 use winit::event::{ElementState, MouseButton};
 
 /// Camera component that defines viewing parameters
@@ -147,9 +147,9 @@ impl CameraController {
         let dx = x - self.last_mouse_pos.0;
         let dy = y - self.last_mouse_pos.1;
 
-        // Update angles (normal direction for intuitive dragging)
-        self.theta -= dx * self.sensitivity; // Reversed for natural feel
-        self.phi += dy * self.sensitivity; // Reversed for natural feel
+        // Update angles - same as original for smooth orbital movement
+        self.theta += dx * self.sensitivity; // Horizontal rotation
+        self.phi -= dy * self.sensitivity; // Vertical rotation (inverted)
 
         // Clamp phi to prevent flipping
         self.phi = self.phi.clamp(0.1, std::f32::consts::PI - 0.1);
@@ -169,17 +169,8 @@ impl CameraController {
     pub fn update_camera_transform(&self, world: &mut World) {
         if let Some(entity) = self.camera_entity {
             if let Some(transform) = world.get_component_mut::<Transform>(entity) {
+                // Just update position - the view matrix handles the look-at
                 transform.position = self.position().to_vec();
-
-                // Calculate look-at rotation (simplified)
-                let forward = (self.center - self.position()).normalize();
-                let right = forward.cross(Vector3::new(0.0, 1.0, 0.0)).normalize();
-                let up = right.cross(forward);
-
-                // This is a simplified rotation calculation
-                // For more accurate rotation, you'd convert the look-at matrix to Euler angles
-                transform.rotation.y = self.theta;
-                transform.rotation.x = self.phi - std::f32::consts::PI * 0.5;
             }
         }
     }

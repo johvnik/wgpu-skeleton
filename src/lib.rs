@@ -309,7 +309,7 @@ impl AppState {
         self.camera_controller
             .update_camera_transform(&mut self.world);
 
-        // Update renderer matrices
+        // Update renderer matrices using the camera controller's view matrix directly
         self.renderer
             .update_view_matrix(self.camera_controller.view_matrix());
     }

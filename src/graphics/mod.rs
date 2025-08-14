@@ -133,6 +133,10 @@ pub struct Renderer {
     uniform_bind_group: wgpu::BindGroup,
     uniforms: Uniforms,
 
+    // Camera matrices (stored separately for proper orbital camera support)
+    current_view_matrix: Matrix4<f32>,
+    current_proj_matrix: Matrix4<f32>,
+
     // Clear color
     clear_color: wgpu::Color,
 }
@@ -325,6 +329,15 @@ impl Renderer {
             cache: None,
         });
 
+        // Initialize view and projection matrices
+        let aspect = config.width as f32 / config.height as f32;
+        let current_view_matrix = Matrix4::look_at_rh(
+            cgmath::Point3::new(10.0, 5.0, 10.0),
+            cgmath::Point3::new(0.0, 0.0, 0.0),
+            cgmath::Vector3::new(0.0, 1.0, 0.0),
+        );
+        let current_proj_matrix = perspective(Deg(45.0), aspect, 0.1, 100.0);
+
         Ok(Self {
             device,
             queue,
@@ -337,6 +350,8 @@ impl Renderer {
             uniform_buffer,
             uniform_bind_group,
             uniforms,
+            current_view_matrix,
+            current_proj_matrix,
             clear_color: wgpu::Color {
                 r: 0.05,
                 g: 0.05,
@@ -353,6 +368,10 @@ impl Renderer {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             self.is_surface_configured = true;
+
+            // Update projection matrix for new aspect ratio
+            let aspect = width as f32 / height as f32;
+            self.current_proj_matrix = perspective(Deg(45.0), aspect, 0.1, 100.0);
         }
     }
 
@@ -376,11 +395,9 @@ impl Renderer {
         )
     }
 
-    /// Update the view matrix
+    /// Update the view matrix (called by camera controller)
     pub fn update_view_matrix(&mut self, view: Matrix4<f32>) {
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        let proj = perspective(Deg(45.0), aspect, 0.1, 100.0);
-        self.uniforms.update_view_proj(view, proj);
+        self.current_view_matrix = view;
     }
 
     /// Request a redraw
@@ -394,24 +411,9 @@ impl Renderer {
             return Ok(());
         }
 
-        // Find the active camera
-        let (view_matrix, proj_matrix) =
-            if let Some((_, camera, transform)) = camera_utils::find_active_camera(world) {
-                let view = camera_utils::view_matrix_from_transform(transform);
-                let aspect = self.config.width as f32 / self.config.height as f32;
-                let proj = camera.projection_matrix(aspect);
-                (view, proj)
-            } else {
-                // Default camera if none found
-                let view = Matrix4::look_at_rh(
-                    cgmath::Point3::new(10.0, 5.0, 10.0),
-                    cgmath::Point3::new(0.0, 0.0, 0.0),
-                    cgmath::Vector3::new(0.0, 1.0, 0.0),
-                );
-                let aspect = self.config.width as f32 / self.config.height as f32;
-                let proj = perspective(Deg(45.0), aspect, 0.1, 100.0);
-                (view, proj)
-            };
+        // Use the stored view and projection matrices from the camera controller
+        let view_matrix = self.current_view_matrix;
+        let proj_matrix = self.current_proj_matrix;
 
         let output = self.surface.get_current_texture()?;
         let view = output
