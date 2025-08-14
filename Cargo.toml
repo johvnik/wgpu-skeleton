@@ -1,7 +1,21 @@
 [package]
-name = "wgpu-skeleton"
+name = "micro3d"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A lightweight, transparent 3D simulation library with ECS architecture"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/micro3d"
+readme = "README.md"
+keywords = ["3d", "graphics", "ecs", "wgpu", "simulation"]
+categories = ["graphics", "game-development", "simulation"]
+
+[lib]
+name = "micro3d"
+path = "src/lib.rs"
+
+[[example]]
+name = "basic_grid"
+path = "examples/basic_grid.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -12,3 +26,7 @@ log = "0.4"
 pollster = "0.4"
 wgpu = "26.0"
 winit = "0.30"
+
+[dev-dependencies]
+env_logger = "0.11"
+pollster = "0.4"

@@ -888,6 +888,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "micro3d"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "cgmath",
+ "env_logger",
+ "log",
+ "pollster",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "naga"
 version = "26.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2127,20 +2141,6 @@ dependencies = [
  "wgpu-types",
  "windows",
  "windows-core",
-]
-
-[[package]]
-name = "wgpu-skeleton"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cgmath",
- "env_logger",
- "log",
- "pollster",
- "wgpu",
- "winit",
 ]
 
 [[package]]

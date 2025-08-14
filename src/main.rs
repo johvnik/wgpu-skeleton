@@ -14,7 +14,7 @@ use winit::window::Window;
 use wgpu::util::DeviceExt;
 
 // Math utilities using cgmath
-use cgmath::{Deg, EuclideanSpace as _, Matrix4, Point3, SquareMatrix as _, Vector3, perspective};
+use cgmath::{perspective, Deg, EuclideanSpace as _, Matrix4, Point3, SquareMatrix as _, Vector3};
 
 /// Main application struct
 pub struct App {
