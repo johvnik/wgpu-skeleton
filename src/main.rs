@@ -1,23 +1,208 @@
-//! This module contains the primary application logic and rendering state for a wgpu-based application.
-//! It's structured to be a robust and extensible foundation for building more complex graphics
-//! or compute applications.
+//! 3D ECS-based template application with infinite ground grid and orbital camera controls.
+//! Built with wgpu 0.26 and winit 0.30 for creating 3D simulations.
 
-// Use log::error for logging critical errors, a common practice in Rust applications.
-use log::error;
-// Use anyhow for easy and descriptive error handling. The Context trait adds the .context() method.
 use anyhow::Context;
-use wgpu::util::DeviceExt as _;
-// Arc (Atomically Reference Counted) is used for safe, shared ownership of the window across threads.
+use log::error;
+use std::collections::HashMap;
 use std::sync::Arc;
-// Import the necessary components from winit for windowing and event handling.
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::Window;
 
+use wgpu::util::DeviceExt;
+
 // Math utilities using cgmath
-use cgmath::{Deg, Matrix4, Point3, SquareMatrix as _, Vector3, perspective};
+use cgmath::{Deg, EuclideanSpace as _, Matrix4, Point3, SquareMatrix as _, Vector3, perspective};
+
+/// Main application struct
+pub struct App {
+    pub state: Option<State>,
+}
+
+impl App {
+    pub fn new() -> Self {
+        Self { state: None }
+    }
+}
+
+// ============================================================================
+// ECS SYSTEM
+// ============================================================================
+
+/// Entity ID - simple integer
+pub type EntityId = u32;
+
+/// Component trait that all components must implement
+pub trait Component: 'static {}
+
+/// ECS World that manages entities and components
+pub struct World {
+    next_entity_id: EntityId,
+    entities: Vec<EntityId>,
+    // Component storage - each component type gets its own HashMap
+    components: HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
+}
+
+impl World {
+    pub fn new() -> Self {
+        Self {
+            next_entity_id: 0,
+            entities: Vec::new(),
+            components: HashMap::new(),
+        }
+    }
+
+    /// Create a new entity
+    pub fn create_entity(&mut self) -> EntityId {
+        let id = self.next_entity_id;
+        self.next_entity_id += 1;
+        self.entities.push(id);
+        id
+    }
+
+    /// Add a component to an entity
+    pub fn add_component<T: Component>(&mut self, entity: EntityId, component: T) {
+        let type_id = std::any::TypeId::of::<T>();
+        let storage = self
+            .components
+            .entry(type_id)
+            .or_insert_with(|| Box::new(HashMap::<EntityId, T>::new()));
+
+        if let Some(storage) = storage.downcast_mut::<HashMap<EntityId, T>>() {
+            storage.insert(entity, component);
+        }
+    }
+
+    /// Get a component from an entity
+    pub fn get_component<T: Component>(&self, entity: EntityId) -> Option<&T> {
+        let type_id = std::any::TypeId::of::<T>();
+        self.components
+            .get(&type_id)?
+            .downcast_ref::<HashMap<EntityId, T>>()?
+            .get(&entity)
+    }
+
+    /// Get a mutable component from an entity
+    pub fn get_component_mut<T: Component>(&mut self, entity: EntityId) -> Option<&mut T> {
+        let type_id = std::any::TypeId::of::<T>();
+        self.components
+            .get_mut(&type_id)?
+            .downcast_mut::<HashMap<EntityId, T>>()?
+            .get_mut(&entity)
+    }
+
+    /// Query for entities with specific components
+    pub fn query<T: Component>(&self) -> impl Iterator<Item = (EntityId, &T)> {
+        let type_id = std::any::TypeId::of::<T>();
+        self.components
+            .get(&type_id)
+            .and_then(|storage| storage.downcast_ref::<HashMap<EntityId, T>>())
+            .map(|storage| storage.iter().map(|(&id, component)| (id, component)))
+            .into_iter()
+            .flatten()
+    }
+
+    /// Query for entities with specific components (mutable)
+    pub fn query_mut<T: Component>(&mut self) -> impl Iterator<Item = (EntityId, &mut T)> {
+        let type_id = std::any::TypeId::of::<T>();
+        self.components
+            .get_mut(&type_id)
+            .and_then(|storage| storage.downcast_mut::<HashMap<EntityId, T>>())
+            .map(|storage| storage.iter_mut().map(|(&id, component)| (id, component)))
+            .into_iter()
+            .flatten()
+    }
+}
+
+// ============================================================================
+// COMPONENTS
+// ============================================================================
+
+/// Transform component for position/rotation/scale
+#[derive(Debug, Clone)]
+pub struct Transform {
+    pub position: Vector3<f32>,
+    pub rotation: Vector3<f32>, // Euler angles in radians
+    pub scale: Vector3<f32>,
+}
+
+impl Component for Transform {}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            position: Vector3::new(0.0, 0.0, 0.0),
+            rotation: Vector3::new(0.0, 0.0, 0.0),
+            scale: Vector3::new(1.0, 1.0, 1.0),
+        }
+    }
+}
+
+impl Transform {
+    pub fn matrix(&self) -> Matrix4<f32> {
+        Matrix4::from_translation(self.position)
+            * Matrix4::from_angle_y(Deg(self.rotation.y))
+            * Matrix4::from_angle_x(Deg(self.rotation.x))
+            * Matrix4::from_angle_z(Deg(self.rotation.z))
+            * Matrix4::from_nonuniform_scale(self.scale.x, self.scale.y, self.scale.z)
+    }
+}
+
+/// Mesh component for renderable geometry
+#[derive(Debug)]
+pub struct Mesh {
+    pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
+    pub num_indices: u32,
+}
+
+impl Component for Mesh {}
+
+/// Velocity component for physics
+#[derive(Debug, Clone)]
+pub struct Velocity {
+    pub linear: Vector3<f32>,
+    pub angular: Vector3<f32>, // Radians per second
+}
+
+impl Component for Velocity {}
+
+impl Default for Velocity {
+    fn default() -> Self {
+        Self {
+            linear: Vector3::new(0.0, 0.0, 0.0),
+            angular: Vector3::new(0.0, 0.0, 0.0),
+        }
+    }
+}
+
+/// Camera component
+#[derive(Debug)]
+pub struct Camera {
+    pub is_active: bool,
+    pub fov: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Component for Camera {}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            is_active: true,
+            fov: 45.0,
+            near: 0.1,
+            far: 100.0,
+        }
+    }
+}
+
+// ============================================================================
+// RESOURCES (Global State)
+// ============================================================================
 
 /// Camera controller for orbital movement
 pub struct CameraController {
@@ -34,6 +219,8 @@ pub struct CameraController {
     last_mouse_pos: (f32, f32),
     /// Current cursor position (tracked from CursorMoved events)
     cursor_pos: (f32, f32),
+    /// The camera entity we're controlling
+    pub camera_entity: Option<EntityId>,
 }
 
 impl CameraController {
@@ -46,6 +233,7 @@ impl CameraController {
             is_dragging: false,
             last_mouse_pos: (0.0, 0.0),
             cursor_pos: (0.0, 0.0),
+            camera_entity: None,
         }
     }
 
@@ -86,11 +274,11 @@ impl CameraController {
     }
 
     /// Handle mouse movement
-    fn mouse_motion(&mut self, x: f32, y: f32) {
+    fn mouse_motion(&mut self, x: f32, y: f32) -> bool {
         self.update_cursor_position(x, y);
 
         if !self.is_dragging {
-            return;
+            return false;
         }
 
         let dx = x - self.last_mouse_pos.0;
@@ -107,13 +295,48 @@ impl CameraController {
         self.phi = self.phi.clamp(0.1, std::f32::consts::PI - 0.1);
 
         self.last_mouse_pos = (x, y);
+
+        true // Indicate that the camera changed
     }
 
     /// Handle mouse wheel for zoom
-    fn mouse_wheel(&mut self, delta: f32) {
+    fn mouse_wheel(&mut self, delta: f32) -> bool {
         self.radius -= delta * 0.1;
         self.radius = self.radius.clamp(2.0, 50.0);
+        true // Camera changed
     }
+
+    /// Update the camera entity's transform
+    fn update_camera_transform(&self, world: &mut World) {
+        if let Some(entity) = self.camera_entity {
+            if let Some(transform) = world.get_component_mut::<Transform>(entity) {
+                transform.position = self.position().to_vec();
+            }
+        }
+    }
+}
+
+/// GPU resources and configuration
+pub struct GpuResources {
+    pub config: wgpu::SurfaceConfiguration,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub surface: wgpu::Surface<'static>,
+    pub window: Arc<Window>,
+    pub is_surface_configured: bool,
+}
+
+/// Rendering resources
+pub struct RenderResources {
+    pub render_pipeline: wgpu::RenderPipeline,
+    pub uniform_buffer: wgpu::Buffer,
+    pub uniform_bind_group: wgpu::BindGroup,
+}
+
+/// Input state tracking
+pub struct InputState {
+    pub modifiers: ModifiersState,
+    pub needs_redraw: bool,
 }
 
 /// Uniform buffer data for shaders
@@ -166,81 +389,36 @@ impl Vertex {
     }
 }
 
-/// The main application struct. It holds the `State`, which contains all the rendering context.
-/// This top-level struct is responsible for managing the application's lifecycle.
-pub struct App {
-    /// The `state` is an `Option` because it is initialized after the application starts,
-    /// specifically in the `resumed` event handler. This is necessary because creating the
-    /// wgpu state requires an active window.
-    pub state: Option<State>,
-}
+// ============================================================================
+// MAIN STATE
+// ============================================================================
 
-impl App {
-    /// Creates a new, empty `App` instance.
-    pub fn new() -> Self {
-        Self { state: None }
-    }
-}
-
-/// The `State` struct encapsulates all the `wgpu` and `winit` objects needed for rendering.
-/// This includes the GPU device, the command queue, the window surface, and configuration.
+/// Main ECS-based state
 pub struct State {
-    /// A wgpu::SurfaceConfiguration defines how the surface will be treated by the device.
-    /// It includes details like the texture format, dimensions, and presentation mode.
-    config: wgpu::SurfaceConfiguration,
-    /// The wgpu::Device is our logical connection to the GPU. We use it to create pipelines,
-    /// buffers, textures, and other GPU resources.
-    device: wgpu::Device,
-    /// A flag to track whether the surface is ready to be rendered to. This is set to true
-    /// after the first resize event.
-    is_surface_configured: bool,
-    /// The wgpu::Queue is used to send commands to the GPU. All rendering and compute
-    /// commands are submitted to this queue.
-    queue: wgpu::Queue,
-    /// The wgpu::Surface is the part of the window that we will draw to. It provides a
-    /// renderable texture for the window. The 'static lifetime is required here because
-    /// winit's ApplicationHandler requires the App state to be 'static.
-    surface: wgpu::Surface<'static>,
-    /// An atomically reference-counted pointer to the application window. This allows both
-    /// our `State` and the `winit` event loop to safely share access to the window.
-    window: Arc<Window>,
+    // ECS World
+    world: World,
 
-    // 3D rendering components
+    // Resources (global state)
+    gpu: GpuResources,
+    render: RenderResources,
     camera_controller: CameraController,
-    uniforms: Uniforms,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-    render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    input: InputState,
 
-    // Input state
-    modifiers: ModifiersState,
+    // Cached uniform data
+    uniforms: Uniforms,
 }
 
 impl State {
-    /// Asynchronously creates a new `State` instance.
-    /// This function is `async` because requesting a GPU adapter and device is an asynchronous operation.
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
 
-        // The wgpu::Instance is the top-level entry point for the wgpu API.
-        // It's used to create Adapters and Surfaces.
-        // wgpu::Backends::PRIMARY selects the most appropriate backend for the platform
-        // (Vulkan on Linux/Windows, Metal on macOS, DX12 on Windows, etc.).
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
-        // Create the wgpu::Surface. This is an unsafe operation because it requires the
-        // window handle to be valid for the lifetime of the surface. We use Arc<Window>
-        // to ensure the window outlives the surface.
         let surface = instance.create_surface(window.clone())?;
 
-        // The wgpu::Adapter represents a physical GPU. We request one from the instance.
-        // We ask for a high-performance adapter that is compatible with our surface.
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -250,28 +428,18 @@ impl State {
             .await
             .context("Failed to find a suitable GPU adapter.")?;
 
-        // The wgpu::Device is our logical connection to the GPU, and the wgpu::Queue is
-        // where we submit command buffers. We request these from the adapter.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Main Device"),
                 required_features: wgpu::Features::empty(),
-                // WebGL doesn't support all of wgpu's features, so if
-                // we're building for the web, we'll have to disable some.
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
-                // Trace is currently unavailable.
-                trace: wgpu::Trace::Off,
+                trace: Default::default(),
             })
             .await
             .context("Failed to create logical device and command queue.")?;
 
-        // Get the surface's capabilities, which include supported formats and present modes.
         let surface_caps = surface.get_capabilities(&adapter);
-
-        // Find a supported sRGB texture format for the surface. sRGB is important for
-        // correct color representation. We fall back to the first available format if
-        // no sRGB format is found.
         let surface_format = surface_caps
             .formats
             .iter()
@@ -279,69 +447,70 @@ impl State {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        // Create the surface configuration. This specifies how textures for the surface
-        // will be created and used.
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
             height: size.height,
-            // Present mode determines how frames are synced to the display.
-            // Fifo is equivalent to VSync and is always supported.
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
 
-        // Initially, the surface is not configured. We will configure it in the `resize`
-        // method, which is guaranteed to be called at least once.
-        let is_surface_configured = false;
+        // Create GPU resources
+        let gpu = GpuResources {
+            surface,
+            device,
+            queue,
+            config,
+            window,
+            is_surface_configured: false,
+        };
 
-        //
-        //
-        //
-        //
-        //
-
-        // Initialize camera controller
-        let camera_controller = CameraController::new();
-
-        // Create uniforms
+        // Initialize uniforms
         let mut uniforms = Uniforms::new();
 
         // Initial projection matrix
         let proj = perspective(
             Deg(45.0),
-            config.width as f32 / config.height as f32,
+            gpu.config.width as f32 / gpu.config.height as f32,
             0.1,
             100.0,
         );
-        uniforms.update_view_proj(camera_controller.view_matrix(), proj);
+        let view = Matrix4::look_at_rh(
+            Point3::new(10.0, 5.0, 10.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        );
+        uniforms.update_view_proj(view, proj);
 
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let uniform_buffer = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
 
         // Create bind group layout
         let uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("uniform_bind_group_layout"),
-            });
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                    label: Some("uniform_bind_group_layout"),
+                });
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let uniform_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -350,101 +519,133 @@ impl State {
             label: Some("uniform_bind_group"),
         });
 
-        // Create shaders
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Grid Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("grid_shader.wgsl").into()),
-        });
-
-        // Create render pipeline
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&uniform_bind_group_layout],
-                push_constant_ranges: &[],
+        // Create shaders and pipeline
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Grid Shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("grid_shader.wgsl").into()),
             });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let render_pipeline_layout =
+            gpu.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Render Pipeline Layout"),
+                    bind_group_layouts: &[&uniform_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let render_pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Render Pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: gpu.config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
+
+        let render = RenderResources {
+            render_pipeline,
+            uniform_buffer,
+            uniform_bind_group,
+        };
+
+        // Initialize ECS World
+        let mut world = World::new();
+
+        // Create camera entity
+        let camera_entity = world.create_entity();
+        world.add_component(camera_entity, Transform::default());
+        world.add_component(camera_entity, Camera::default());
+
+        // Create grid entity
+        let grid_entity = world.create_entity();
+        world.add_component(grid_entity, Transform::default());
 
         // Create grid geometry
         let (vertices, indices) = create_grid(50, 1.0);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let vertex_buffer = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Grid Vertex Buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
 
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let index_buffer = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Grid Index Buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
-        let num_indices = indices.len() as u32;
+        world.add_component(
+            grid_entity,
+            Mesh {
+                vertex_buffer,
+                index_buffer,
+                num_indices: indices.len() as u32,
+            },
+        );
+
+        // Initialize camera controller
+        let mut camera_controller = CameraController::new();
+        camera_controller.camera_entity = Some(camera_entity);
+
+        let input = InputState {
+            modifiers: ModifiersState::default(),
+            needs_redraw: true, // Initial draw
+        };
 
         Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
-            is_surface_configured,
-            window,
+            world,
+            gpu,
+            render,
             camera_controller,
+            input,
             uniforms,
-            uniform_buffer,
-            uniform_bind_group,
-            render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices,
-            modifiers: ModifiersState::default(),
         })
     }
 
-    /// Handles keyboard input events.
     fn handle_key(
         &self,
         event_loop: &ActiveEventLoop,
@@ -452,78 +653,83 @@ impl State {
         is_pressed: bool,
         modifiers: ModifiersState,
     ) {
+        // Exit with Ctrl+C
         if let (KeyCode::KeyC, true) = (code, is_pressed) {
-            // CONTROL
             if modifiers.control_key() {
                 event_loop.exit();
             }
         }
     }
 
-    /// Resizes the surface and updates the configuration when the window size changes.
     pub fn resize(&mut self, width: u32, height: u32) {
-        // We only reconfigure the surface if the new size is not zero.
         if width > 0 && height > 0 {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
-            // Mark the surface as configured so rendering can proceed.
-            self.is_surface_configured = true;
+            self.gpu.config.width = width;
+            self.gpu.config.height = height;
+            self.gpu
+                .surface
+                .configure(&self.gpu.device, &self.gpu.config);
+            self.gpu.is_surface_configured = true;
 
             // Update projection matrix for new aspect ratio
             let proj = perspective(Deg(45.0), width as f32 / height as f32, 0.1, 100.0);
             self.uniforms
                 .update_view_proj(self.camera_controller.view_matrix(), proj);
-            self.queue.write_buffer(
-                &self.uniform_buffer,
+            self.gpu.queue.write_buffer(
+                &self.render.uniform_buffer,
                 0,
                 bytemuck::cast_slice(&[self.uniforms]),
             );
+
+            self.input.needs_redraw = true;
         }
     }
 
     fn update(&mut self) {
+        if !self.input.needs_redraw {
+            return;
+        }
+
+        // Update camera transform in ECS
+        self.camera_controller
+            .update_camera_transform(&mut self.world);
+
         // Update view matrix
         let proj = perspective(
             Deg(45.0),
-            self.config.width as f32 / self.config.height as f32,
+            self.gpu.config.width as f32 / self.gpu.config.height as f32,
             0.1,
             100.0,
         );
         self.uniforms
             .update_view_proj(self.camera_controller.view_matrix(), proj);
-        self.queue.write_buffer(
-            &self.uniform_buffer,
+        self.gpu.queue.write_buffer(
+            &self.render.uniform_buffer,
             0,
             bytemuck::cast_slice(&[self.uniforms]),
         );
+
+        // Request redraw only when needed
+        self.gpu.window.request_redraw();
+        self.input.needs_redraw = false;
     }
 
-    /// Renders a single frame to the window.
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // Before doing anything, request a redraw. This ensures that we will get another
-        // RedrawRequested event, creating a continuous render loop.
-        self.window.request_redraw();
+        self.gpu.window.request_redraw();
 
-        // If the surface isn't configured yet (e.g., at startup), we can't render.
-        // We return Ok(()) to skip rendering for this frame.
-        if !self.is_surface_configured {
+        if !self.gpu.is_surface_configured {
             return Ok(());
         }
 
-        // Get the next texture from the swap chain to render to.
-        let output = self.surface.get_current_texture()?;
-
-        // Create a view of the texture. This is what the render pass will use.
+        let output = self.gpu.surface.get_current_texture()?;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create depth texture
-        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        let depth_texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
             size: wgpu::Extent3d {
-                width: self.config.width,
-                height: self.config.height,
+                width: self.gpu.config.width,
+                height: self.gpu.config.height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -537,30 +743,26 @@ impl State {
 
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // A CommandEncoder builds a command buffer that we can send to the GPU.
         let mut encoder = self
+            .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Render Encoder"),
             });
 
-        // The `begin_render_pass` block scopes the render pass.
-        // We can't use the encoder for other purposes while a render pass is active.
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
-                    resolve_target: None, // Used for multisampling
+                    resolve_target: None,
                     ops: wgpu::Operations {
-                        // Clear the screen with a specific color before drawing.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.05,
                             g: 0.05,
                             b: 0.1,
                             a: 1.0,
                         }),
-                        // Store the results of the render pass to the texture.
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -577,89 +779,100 @@ impl State {
                 timestamp_writes: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
-        } // The render pass is dropped here, and the borrow of `encoder` is released.
+            render_pass.set_pipeline(&self.render.render_pipeline);
+            render_pass.set_bind_group(0, &self.render.uniform_bind_group, &[]);
 
-        // Finalize the command buffer and submit it to the GPU's command queue.
-        self.queue.submit(std::iter::once(encoder.finish()));
+            // Render all entities with Mesh components
+            for (_entity_id, mesh) in self.world.query::<Mesh>() {
+                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            }
+        }
 
-        // Present the rendered texture to the screen.
+        self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok(())
     }
 }
 
-/// Implement the winit ApplicationHandler trait for our App.
-/// This trait organizes the event loop logic.
 impl ApplicationHandler for App {
-    /// Called when the event loop is resumed. This is the first event you will receive,
-    /// and it is the ideal place to create your window and rendering state.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Create the main window.
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes())
+                .create_window(Window::default_attributes().with_title("3D ECS Grid Template"))
                 .expect("Failed to create window"),
         );
 
-        // Asynchronously create the `State` and block until it's ready.
-        // This is the standard way to initialize wgpu in a winit application.
         self.state =
             Some(pollster::block_on(State::new(window)).expect("Failed to create wgpu state"));
     }
 
-    /// This is the main event handler for all window-related events.
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        // We need mutable access to the state, so we borrow it here.
-        // If the state hasn't been initialized yet, we simply return.
         let state = match &mut self.state {
             Some(state) => state,
             None => return,
         };
 
         match event {
-            // The window was requested to be closed (e.g., by clicking the 'X' button).
             WindowEvent::CloseRequested => event_loop.exit(),
 
-            // The window was resized. We need to update our surface configuration.
-            WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.resize(size.width, size.height);
+            }
 
-            // This event is sent when the window needs to be redrawn, either because the
-            // OS requested it or because we called `window.request_redraw()`.
             WindowEvent::RedrawRequested => {
                 state.update();
                 match state.render() {
                     Ok(_) => {}
-                    // Reconfigure the surface if it's lost or outdated. This can happen when
-                    // the window is minimized or moved to a different monitor.
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        let size = state.window.inner_size();
+                        let size = state.gpu.window.inner_size();
                         state.resize(size.width, size.height);
                     }
-                    // If the system is out of memory, we can't recover, so we panic.
                     Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
-                    // All other errors (Timeout, etc.) should be logged.
-                    Err(e) => {
-                        error!("Error during render: {}", e);
-                    }
+                    Err(e) => error!("Error during render: {}", e),
+                }
+            }
+
+            WindowEvent::MouseInput {
+                button,
+                state: button_state,
+                ..
+            } => {
+                state.camera_controller.mouse_button(button, button_state);
+                state.input.needs_redraw = true;
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                if state
+                    .camera_controller
+                    .mouse_motion(position.x as f32, position.y as f32)
+                {
+                    state.input.needs_redraw = true;
+                }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll_delta = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
+                };
+                if state.camera_controller.mouse_wheel(scroll_delta) {
+                    state.input.needs_redraw = true;
                 }
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
-                state.modifiers = new_modifiers.state();
+                state.input.modifiers = new_modifiers.state();
             }
 
-            // Handle keyboard input.
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -672,38 +885,14 @@ impl ApplicationHandler for App {
                 event_loop,
                 code,
                 key_state == ElementState::Pressed,
-                state.modifiers,
+                state.input.modifiers,
             ),
 
-            WindowEvent::MouseInput {
-                button,
-                state: button_state,
-                ..
-            } => {
-                state.camera_controller.mouse_button(button, button_state);
-            }
-
-            WindowEvent::CursorMoved { position, .. } => {
-                state
-                    .camera_controller
-                    .mouse_motion(position.x as f32, position.y as f32);
-            }
-
-            WindowEvent::MouseWheel { delta, .. } => {
-                let scroll_delta = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
-                };
-                state.camera_controller.mouse_wheel(scroll_delta);
-            }
-
-            // All other window events are ignored for this simple example.
             _ => {}
         }
     }
 }
 
-/// Create a grid of vertices and indices
 /// Create a grid of vertices and indices
 fn create_grid(size: u32, spacing: f32) -> (Vec<Vertex>, Vec<u16>) {
     let mut vertices = Vec::new();
@@ -762,31 +951,18 @@ fn create_grid(size: u32, spacing: f32) -> (Vec<Vertex>, Vec<u16>) {
     (vertices, indices)
 }
 
-/// The main entry point for the application.
 pub fn run() -> anyhow::Result<()> {
-    // Initialize the logger. This allows wgpu to print validation errors and other info.
     env_logger::init();
-
-    // Create the winit event loop.
     let event_loop = EventLoop::new()?;
-
-    event_loop.set_control_flow(ControlFlow::Wait);
-
-    // Create our main application struct.
+    event_loop.set_control_flow(ControlFlow::Wait); // More efficient for event-driven rendering
     let mut app = App::new();
-
-    // Run the application's event loop.
     event_loop.run_app(&mut app)?;
-
     Ok(())
 }
 
-/// The main function of the program.
 fn main() {
-    // Run the application and print any errors that occur.
     if let Err(error) = run() {
-        // Using {:?} is helpful for diagnosing issues with anyhow's error chains.
         eprintln!("Error: {:?}", error);
         std::process::exit(1);
-    };
+    }
 }
