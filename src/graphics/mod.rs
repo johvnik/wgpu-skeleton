@@ -123,11 +123,12 @@ pub struct Renderer {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    pub window: Arc<Window>, // Make window public for internal access
+    pub window: Arc<Window>,
     is_surface_configured: bool,
 
     // Rendering resources
-    render_pipeline: wgpu::RenderPipeline,
+    triangle_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     uniforms: Uniforms,
@@ -221,7 +222,7 @@ impl Renderer {
             label: Some("uniform_bind_group"),
         });
 
-        // Create shader and pipeline
+        // Create shader and pipelines
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Default Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/default.wgsl").into()),
@@ -234,8 +235,9 @@ impl Renderer {
                 push_constant_ranges: &[],
             });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
+        // Triangle pipeline
+        let triangle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Triangle Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -278,6 +280,51 @@ impl Renderer {
             cache: None,
         });
 
+        // Line pipeline
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Line Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // No culling for lines
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         Ok(Self {
             device,
             queue,
@@ -285,7 +332,8 @@ impl Renderer {
             config,
             window,
             is_surface_configured: false,
-            render_pipeline,
+            triangle_pipeline,
+            line_pipeline,
             uniform_buffer,
             uniform_bind_group,
             uniforms,
@@ -342,8 +390,6 @@ impl Renderer {
 
     /// Render the current frame
     pub fn render(&mut self, world: &World) -> Result<(), wgpu::SurfaceError> {
-        self.window.request_redraw();
-
         if !self.is_surface_configured {
             return Ok(());
         }
@@ -420,11 +466,11 @@ impl Renderer {
                 timestamp_writes: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            // Group meshes by topology to minimize pipeline changes
+            let mut triangle_meshes = Vec::new();
+            let mut line_meshes = Vec::new();
 
-            // Render all entities with Mesh components
             for (entity_id, mesh) in world.query::<Mesh>() {
-                // Get transform for this entity
                 let model_matrix =
                     if let Some(transform) = world.get_component::<Transform>(entity_id) {
                         transform.matrix()
@@ -432,20 +478,60 @@ impl Renderer {
                         Matrix4::identity()
                     };
 
-                // Update uniforms for this object
-                self.uniforms.update_view_proj(view_matrix, proj_matrix);
-                self.uniforms.update_model(model_matrix);
-                self.queue.write_buffer(
-                    &self.uniform_buffer,
-                    0,
-                    bytemuck::cast_slice(&[self.uniforms]),
-                );
+                match mesh.primitive_topology {
+                    wgpu::PrimitiveTopology::TriangleList => {
+                        triangle_meshes.push((mesh, model_matrix));
+                    }
+                    wgpu::PrimitiveTopology::LineList => {
+                        line_meshes.push((mesh, model_matrix));
+                    }
+                    _ => {
+                        // Handle other topologies as triangles for now
+                        triangle_meshes.push((mesh, model_matrix));
+                    }
+                }
+            }
 
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            // Render triangles
+            if !triangle_meshes.is_empty() {
+                render_pass.set_pipeline(&self.triangle_pipeline);
+
+                for (mesh, model_matrix) in triangle_meshes {
+                    self.uniforms.update_view_proj(view_matrix, proj_matrix);
+                    self.uniforms.update_model(model_matrix);
+                    self.queue.write_buffer(
+                        &self.uniform_buffer,
+                        0,
+                        bytemuck::cast_slice(&[self.uniforms]),
+                    );
+
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass
+                        .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                }
+            }
+
+            // Render lines
+            if !line_meshes.is_empty() {
+                render_pass.set_pipeline(&self.line_pipeline);
+
+                for (mesh, model_matrix) in line_meshes {
+                    self.uniforms.update_view_proj(view_matrix, proj_matrix);
+                    self.uniforms.update_model(model_matrix);
+                    self.queue.write_buffer(
+                        &self.uniform_buffer,
+                        0,
+                        bytemuck::cast_slice(&[self.uniforms]),
+                    );
+
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass
+                        .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                }
             }
         }
 

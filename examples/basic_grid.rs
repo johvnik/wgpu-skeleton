@@ -108,41 +108,42 @@ fn rotation_system(
 
 /// Create a simple cube mesh
 fn create_cube_mesh(renderer: &micro3d::graphics::Renderer) -> micro3d::graphics::Mesh {
-    // Cube vertices (position + color)
+    // Cube vertices (position + color) - simple orange cube
+    let cube_color = [1.0, 0.5, 0.0]; // Orange
     let vertices = vec![
         // Front face
         micro3d::graphics::Vertex {
             position: [-0.5, -0.5, 0.5],
-            color: [1.0, 0.0, 0.0],
+            color: cube_color,
         },
         micro3d::graphics::Vertex {
             position: [0.5, -0.5, 0.5],
-            color: [0.0, 1.0, 0.0],
+            color: cube_color,
         },
         micro3d::graphics::Vertex {
             position: [0.5, 0.5, 0.5],
-            color: [0.0, 0.0, 1.0],
+            color: cube_color,
         },
         micro3d::graphics::Vertex {
             position: [-0.5, 0.5, 0.5],
-            color: [1.0, 1.0, 0.0],
+            color: cube_color,
         },
         // Back face
         micro3d::graphics::Vertex {
             position: [-0.5, -0.5, -0.5],
-            color: [1.0, 0.0, 1.0],
+            color: cube_color,
         },
         micro3d::graphics::Vertex {
             position: [0.5, -0.5, -0.5],
-            color: [0.0, 1.0, 1.0],
+            color: cube_color,
         },
         micro3d::graphics::Vertex {
             position: [0.5, 0.5, -0.5],
-            color: [1.0, 1.0, 1.0],
+            color: cube_color,
         },
         micro3d::graphics::Vertex {
             position: [-0.5, 0.5, -0.5],
-            color: [0.5, 0.5, 0.5],
+            color: cube_color,
         },
     ];
 

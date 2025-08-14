@@ -147,9 +147,9 @@ impl CameraController {
         let dx = x - self.last_mouse_pos.0;
         let dy = y - self.last_mouse_pos.1;
 
-        // Update angles (reversed for intuitive dragging)
-        self.theta += dx * self.sensitivity;
-        self.phi -= dy * self.sensitivity;
+        // Update angles (normal direction for intuitive dragging)
+        self.theta -= dx * self.sensitivity; // Reversed for natural feel
+        self.phi += dy * self.sensitivity; // Reversed for natural feel
 
         // Clamp phi to prevent flipping
         self.phi = self.phi.clamp(0.1, std::f32::consts::PI - 0.1);

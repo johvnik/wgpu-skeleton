@@ -714,8 +714,6 @@ impl State {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        self.gpu.window.request_redraw();
-
         if !self.gpu.is_surface_configured {
             return Ok(());
         }
