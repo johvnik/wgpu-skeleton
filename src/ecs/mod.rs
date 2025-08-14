@@ -1,10 +1,10 @@
 //! Entity Component System implementation
-//! 
+//!
 //! A simple but flexible ECS that allows you to build complex simulations
 //! from simple components and systems.
 
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::any::{TypeId, Any};
 
 /// Entity ID - simple integer
 pub type EntityId = u32;
@@ -40,7 +40,10 @@ impl World {
     /// Create an entity with a builder pattern
     pub fn spawn(&mut self) -> EntityBuilder {
         let id = self.create_entity();
-        EntityBuilder { world: self, entity: id }
+        EntityBuilder {
+            world: self,
+            entity: id,
+        }
     }
 
     /// Add a component to an entity
@@ -113,7 +116,7 @@ impl World {
     /// Remove an entity and all its components
     pub fn despawn(&mut self, entity: EntityId) {
         self.entities.retain(|&e| e != entity);
-        
+
         // Remove from all component storages
         for storage in self.components.values_mut() {
             // This is a bit of a hack since we can't know the exact type
