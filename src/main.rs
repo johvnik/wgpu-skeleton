@@ -6,14 +6,165 @@
 use log::error;
 // Use anyhow for easy and descriptive error handling. The Context trait adds the .context() method.
 use anyhow::Context;
+use wgpu::util::DeviceExt as _;
 // Arc (Atomically Reference Counted) is used for safe, shared ownership of the window across threads.
 use std::sync::Arc;
 // Import the necessary components from winit for windowing and event handling.
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::Window;
+
+// Math utilities using cgmath
+use cgmath::{Deg, Matrix4, Point3, SquareMatrix as _, Vector3, perspective};
+
+/// Camera controller for orbital movement
+pub struct CameraController {
+    /// Distance from the center point
+    radius: f32,
+    /// Horizontal rotation angle (yaw)
+    theta: f32,
+    /// Vertical rotation angle (pitch)  
+    phi: f32,
+    /// Center point we're rotating around
+    center: Point3<f32>,
+    /// Mouse drag state
+    is_dragging: bool,
+    last_mouse_pos: (f32, f32),
+    /// Current cursor position (tracked from CursorMoved events)
+    cursor_pos: (f32, f32),
+}
+
+impl CameraController {
+    fn new() -> Self {
+        Self {
+            radius: 10.0,
+            theta: 0.0,
+            phi: std::f32::consts::PI * 0.3, // Start at 30 degrees elevation
+            center: Point3::new(0.0, 0.0, 0.0),
+            is_dragging: false,
+            last_mouse_pos: (0.0, 0.0),
+            cursor_pos: (0.0, 0.0),
+        }
+    }
+
+    /// Get the current camera position based on spherical coordinates
+    fn position(&self) -> Point3<f32> {
+        let x = self.center.x + self.radius * self.phi.sin() * self.theta.cos();
+        let y = self.center.y + self.radius * self.phi.cos();
+        let z = self.center.z + self.radius * self.phi.sin() * self.theta.sin();
+        Point3::new(x, y, z)
+    }
+
+    /// Create the view matrix
+    fn view_matrix(&self) -> Matrix4<f32> {
+        let position = self.position();
+        let target = self.center;
+        let up = Vector3::new(0.0, 1.0, 0.0);
+        Matrix4::look_at_rh(position, target, up)
+    }
+
+    /// Handle mouse button press/release
+    fn mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        if button == MouseButton::Left {
+            match state {
+                ElementState::Pressed => {
+                    self.is_dragging = true;
+                    self.last_mouse_pos = self.cursor_pos;
+                }
+                ElementState::Released => {
+                    self.is_dragging = false;
+                }
+            }
+        }
+    }
+
+    /// Update cursor position from CursorMoved events
+    fn update_cursor_position(&mut self, x: f32, y: f32) {
+        self.cursor_pos = (x, y);
+    }
+
+    /// Handle mouse movement
+    fn mouse_motion(&mut self, x: f32, y: f32) {
+        self.update_cursor_position(x, y);
+
+        if !self.is_dragging {
+            return;
+        }
+
+        let dx = x - self.last_mouse_pos.0;
+        let dy = y - self.last_mouse_pos.1;
+
+        // Sensitivity for rotation
+        let sensitivity = 0.01;
+
+        // Update angles (reversed for intuitive dragging)
+        self.theta += dx * sensitivity;
+        self.phi -= dy * sensitivity;
+
+        // Clamp phi to prevent flipping
+        self.phi = self.phi.clamp(0.1, std::f32::consts::PI - 0.1);
+
+        self.last_mouse_pos = (x, y);
+    }
+
+    /// Handle mouse wheel for zoom
+    fn mouse_wheel(&mut self, delta: f32) {
+        self.radius -= delta * 0.1;
+        self.radius = self.radius.clamp(2.0, 50.0);
+    }
+}
+
+/// Uniform buffer data for shaders
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Uniforms {
+    view_proj: [[f32; 4]; 4],
+}
+
+impl Uniforms {
+    fn new() -> Self {
+        Self {
+            view_proj: Matrix4::identity().into(),
+        }
+    }
+
+    fn update_view_proj(&mut self, view: Matrix4<f32>, proj: Matrix4<f32>) {
+        self.view_proj = (proj * view).into();
+    }
+}
+
+/// Vertex structure for our grid
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                // Position
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                // Color
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+            ],
+        }
+    }
+}
 
 /// The main application struct. It holds the `State`, which contains all the rendering context.
 /// This top-level struct is responsible for managing the application's lifecycle.
@@ -53,6 +204,19 @@ pub struct State {
     /// An atomically reference-counted pointer to the application window. This allows both
     /// our `State` and the `winit` event loop to safely share access to the window.
     window: Arc<Window>,
+
+    // 3D rendering components
+    camera_controller: CameraController,
+    uniforms: Uniforms,
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
+    render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+
+    // Input state
+    modifiers: ModifiersState,
 }
 
 impl State {
@@ -134,6 +298,133 @@ impl State {
         // method, which is guaranteed to be called at least once.
         let is_surface_configured = false;
 
+        //
+        //
+        //
+        //
+        //
+
+        // Initialize camera controller
+        let camera_controller = CameraController::new();
+
+        // Create uniforms
+        let mut uniforms = Uniforms::new();
+
+        // Initial projection matrix
+        let proj = perspective(
+            Deg(45.0),
+            config.width as f32 / config.height as f32,
+            0.1,
+            100.0,
+        );
+        uniforms.update_view_proj(camera_controller.view_matrix(), proj);
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create bind group layout
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("uniform_bind_group_layout"),
+            });
+
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+            label: Some("uniform_bind_group"),
+        });
+
+        // Create shaders
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Grid Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("grid_shader.wgsl").into()),
+        });
+
+        // Create render pipeline
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[&uniform_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Create grid geometry
+        let (vertices, indices) = create_grid(50, 1.0);
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let num_indices = indices.len() as u32;
+
         Ok(Self {
             surface,
             device,
@@ -141,14 +432,31 @@ impl State {
             config,
             is_surface_configured,
             window,
+            camera_controller,
+            uniforms,
+            uniform_buffer,
+            uniform_bind_group,
+            render_pipeline,
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+            modifiers: ModifiersState::default(),
         })
     }
 
     /// Handles keyboard input events.
-    fn handle_key(&self, event_loop: &ActiveEventLoop, code: KeyCode, is_pressed: bool) {
-        // Exit the application when the Escape key is pressed.
-        if let (KeyCode::Escape, true) = (code, is_pressed) {
-            event_loop.exit();
+    fn handle_key(
+        &self,
+        event_loop: &ActiveEventLoop,
+        code: KeyCode,
+        is_pressed: bool,
+        modifiers: ModifiersState,
+    ) {
+        if let (KeyCode::KeyC, true) = (code, is_pressed) {
+            // CONTROL
+            if modifiers.control_key() {
+                event_loop.exit();
+            }
         }
     }
 
@@ -161,7 +469,34 @@ impl State {
             self.surface.configure(&self.device, &self.config);
             // Mark the surface as configured so rendering can proceed.
             self.is_surface_configured = true;
+
+            // Update projection matrix for new aspect ratio
+            let proj = perspective(Deg(45.0), width as f32 / height as f32, 0.1, 100.0);
+            self.uniforms
+                .update_view_proj(self.camera_controller.view_matrix(), proj);
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[self.uniforms]),
+            );
         }
+    }
+
+    fn update(&mut self) {
+        // Update view matrix
+        let proj = perspective(
+            Deg(45.0),
+            self.config.width as f32 / self.config.height as f32,
+            0.1,
+            100.0,
+        );
+        self.uniforms
+            .update_view_proj(self.camera_controller.view_matrix(), proj);
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.uniforms]),
+        );
     }
 
     /// Renders a single frame to the window.
@@ -184,6 +519,24 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Create depth texture
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            size: wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            label: Some("depth_texture"),
+            view_formats: &[],
+        });
+
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         // A CommandEncoder builds a command buffer that we can send to the GPU.
         let mut encoder = self
             .device
@@ -194,7 +547,7 @@ impl State {
         // The `begin_render_pass` block scopes the render pass.
         // We can't use the encoder for other purposes while a render pass is active.
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -202,9 +555,9 @@ impl State {
                     ops: wgpu::Operations {
                         // Clear the screen with a specific color before drawing.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                            r: 0.05,
+                            g: 0.05,
+                            b: 0.1,
                             a: 1.0,
                         }),
                         // Store the results of the render pass to the texture.
@@ -212,10 +565,23 @@ impl State {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         } // The render pass is dropped here, and the borrow of `encoder` is released.
 
         // Finalize the command buffer and submit it to the GPU's command queue.
@@ -270,6 +636,7 @@ impl ApplicationHandler for App {
             // This event is sent when the window needs to be redrawn, either because the
             // OS requested it or because we called `window.request_redraw()`.
             WindowEvent::RedrawRequested => {
+                state.update();
                 match state.render() {
                     Ok(_) => {}
                     // Reconfigure the surface if it's lost or outdated. This can happen when
@@ -287,6 +654,10 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                state.modifiers = new_modifiers.state();
+            }
+
             // Handle keyboard input.
             WindowEvent::KeyboardInput {
                 event:
@@ -296,12 +667,98 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => state.handle_key(event_loop, code, key_state == ElementState::Pressed),
+            } => state.handle_key(
+                event_loop,
+                code,
+                key_state == ElementState::Pressed,
+                state.modifiers,
+            ),
+
+            WindowEvent::MouseInput {
+                button,
+                state: button_state,
+                ..
+            } => {
+                state.camera_controller.mouse_button(button, button_state);
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                state
+                    .camera_controller
+                    .mouse_motion(position.x as f32, position.y as f32);
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll_delta = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
+                };
+                state.camera_controller.mouse_wheel(scroll_delta);
+            }
 
             // All other window events are ignored for this simple example.
             _ => {}
         }
     }
+}
+
+/// Create a grid of vertices and indices
+/// Create a grid of vertices and indices
+fn create_grid(size: u32, spacing: f32) -> (Vec<Vertex>, Vec<u16>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    let half_size = size as f32 * spacing * 0.5;
+    let grid_color = [0.3, 0.3, 0.3]; // Dark gray
+    let axis_color = [0.6, 0.6, 0.6]; // Lighter gray for main axes
+
+    // Create vertices for horizontal lines
+    for i in 0..=size {
+        let z = i as f32 * spacing - half_size;
+        let color = if i == size / 2 {
+            axis_color
+        } else {
+            grid_color
+        };
+
+        vertices.push(Vertex {
+            position: [-half_size, 0.0, z],
+            color,
+        });
+        vertices.push(Vertex {
+            position: [half_size, 0.0, z],
+            color,
+        });
+    }
+
+    // Create vertices for vertical lines
+    for i in 0..=size {
+        let x = i as f32 * spacing - half_size;
+        let color = if i == size / 2 {
+            axis_color
+        } else {
+            grid_color
+        };
+
+        vertices.push(Vertex {
+            position: [x, 0.0, -half_size],
+            color,
+        });
+        vertices.push(Vertex {
+            position: [x, 0.0, half_size],
+            color,
+        });
+    }
+
+    // Create indices for lines
+    for i in 0..vertices.len() {
+        if i % 2 == 0 {
+            indices.push(i as u16);
+            indices.push((i + 1) as u16);
+        }
+    }
+
+    (vertices, indices)
 }
 
 /// The main entry point for the application.
@@ -312,9 +769,8 @@ pub fn run() -> anyhow::Result<()> {
     // Create the winit event loop.
     let event_loop = EventLoop::new()?;
 
-    // Set the control flow to Wait. This means the event loop will sleep until a new
-    // event arrives, which is ideal for applications that don't need to render continuously.
-    event_loop.set_control_flow(ControlFlow::Wait);
+    // Set control flow to poll for smooth interaction.
+    event_loop.set_control_flow(ControlFlow::Poll);
 
     // Create our main application struct.
     let mut app = App::new();
